@@ -3,7 +3,8 @@ import os
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                              QTextEdit, QPushButton, QDialog, QMessageBox, QFileDialog,
                              QListWidget, QFormLayout, QDialogButtonBox, QSpinBox,
-                             QDoubleSpinBox, QCheckBox, QInputDialog, QGroupBox)
+                             QDoubleSpinBox, QCheckBox, QInputDialog, QGroupBox,
+                             QTabWidget)
 from PyQt6.QtCore import Qt, QSettings
 
 class WelcomeDialog(QDialog):
@@ -129,6 +130,103 @@ class SettingsDialog(QDialog):
         self.settings.setValue("max_tokens", self.tokens_input.value())
         self.settings.setValue("confirm_delete", self.confirm_delete_cb.isChecked())
         self.accept()
+
+class SettingsDialog(QDialog):
+    """升级版设置面板：支持剧情商讨 / 正文创作两套模型配置。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ 全局设置 & 双模型参数")
+        self.setFixedSize(620, 520)
+        self.settings = QSettings("AIWriter", "Settings")
+        self.profile_widgets = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        self.confirm_delete_cb = QCheckBox("删除卷/章时进行二次确认")
+        self.confirm_delete_cb.setChecked(self.settings.value("confirm_delete", True, type=bool))
+        layout.addWidget(self.confirm_delete_cb)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_profile_tab("chat", "剧情商讨模型", 0.7, 4000), "剧情商讨模型")
+        tabs.addTab(self._build_profile_tab("draft", "正文创作模型", 1.2, 6000), "正文创作模型")
+        layout.addWidget(tabs)
+
+        hint = QLabel("两个窗口可以分别使用不同 OpenAI-compatible API。旧版单模型配置会自动作为默认值带入。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #606266;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.save_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _legacy(self, key, default):
+        value = self.settings.value(key, default)
+        return value if value not in (None, "") else default
+
+    def _build_profile_tab(self, role, display_name, default_temp, default_tokens):
+        widget = QWidget()
+        form = QFormLayout(widget)
+        form.setContentsMargins(10, 15, 10, 10)
+        form.setSpacing(12)
+
+        prefix = f"profiles/{role}/"
+        name_input = QLineEdit(self.settings.value(prefix + "name", display_name))
+        api_key_input = QLineEdit(self.settings.value(prefix + "api_key", self.settings.value("api_key", "")))
+        api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        base_url_input = QLineEdit(self.settings.value(prefix + "base_url", self._legacy("base_url", "https://api.deepseek.com")))
+        model_input = QLineEdit(self.settings.value(prefix + "model", self._legacy("model", "deepseek-reasoner")))
+
+        temp_input = QDoubleSpinBox()
+        temp_input.setRange(0.0, 1.99)
+        temp_input.setSingleStep(0.1)
+        temp_input.setValue(float(self.settings.value(prefix + "temperature", self._legacy("temperature", default_temp))))
+
+        tokens_input = QSpinBox()
+        tokens_input.setRange(500, 128000)
+        tokens_input.setSingleStep(500)
+        tokens_input.setValue(int(self.settings.value(prefix + "max_tokens", self._legacy("max_tokens", default_tokens))))
+
+        form.addRow("配置名称:", name_input)
+        form.addRow("API Key:", api_key_input)
+        form.addRow("Base URL:", base_url_input)
+        form.addRow("模型名称:", model_input)
+        form.addRow("Temperature:", temp_input)
+        form.addRow("Max Tokens:", tokens_input)
+
+        self.profile_widgets[role] = {
+            "name": name_input,
+            "api_key": api_key_input,
+            "base_url": base_url_input,
+            "model": model_input,
+            "temperature": temp_input,
+            "max_tokens": tokens_input,
+        }
+        return widget
+
+    def save_and_accept(self):
+        for role, widgets in self.profile_widgets.items():
+            prefix = f"profiles/{role}/"
+            self.settings.setValue(prefix + "name", widgets["name"].text().strip())
+            self.settings.setValue(prefix + "api_key", widgets["api_key"].text().strip())
+            self.settings.setValue(prefix + "base_url", widgets["base_url"].text().strip())
+            self.settings.setValue(prefix + "model", widgets["model"].text().strip())
+            self.settings.setValue(prefix + "temperature", widgets["temperature"].value())
+            self.settings.setValue(prefix + "max_tokens", widgets["max_tokens"].value())
+
+        draft = self.profile_widgets["draft"]
+        self.settings.setValue("api_key", draft["api_key"].text().strip())
+        self.settings.setValue("base_url", draft["base_url"].text().strip())
+        self.settings.setValue("model", draft["model"].text().strip())
+        self.settings.setValue("temperature", draft["temperature"].value())
+        self.settings.setValue("max_tokens", draft["max_tokens"].value())
+        self.settings.setValue("confirm_delete", self.confirm_delete_cb.isChecked())
+        self.accept()
+
 
 class CharacterWidget(QGroupBox):
     def __init__(self, parent_remove_func, init_data=None):

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+novel_memory.sqlite3
+*.log
+startup_error.log
+launcher.log
+build/
+dist/
+*.spec
+.agents/
+.codex/
+AI_Novel_Assistant_Portable.zip
+*.zip

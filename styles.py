@@ -14,7 +14,7 @@ QWidget {
 QPushButton {
     background-color: #FFFFFF;
     border: 1px solid #DCDFE6;
-    border-radius: 6px;
+    border-radius: 12px;
     padding: 8px 16px;
     color: #606266;
     font-weight: 500;
@@ -30,7 +30,7 @@ QPushButton:pressed {
 }
 QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox {
     border: 1px solid #DCDFE6;
-    border-radius: 6px;
+    border-radius: 12px;
     padding: 8px;
     background-color: #FFFFFF;
     selection-background-color: #409EFF;
@@ -46,7 +46,7 @@ QTreeWidget {
 }
 QTreeWidget::item {
     padding: 6px;
-    border-radius: 4px;
+    border-radius: 10px;
 }
 QTreeWidget::item:selected {
     background-color: #ECF5FF;
@@ -54,7 +54,7 @@ QTreeWidget::item:selected {
 }
 QGroupBox {
     border: 1px solid #EBEEF5;
-    border-radius: 8px;
+    border-radius: 14px;
     margin-top: 20px;
     background-color: #FFFFFF;
     padding-top: 15px;
@@ -77,18 +77,18 @@ QScrollBar:vertical {
     border: none;
     background: #F5F7FA;
     width: 8px;
-    border-radius: 4px;
+    border-radius: 8px;
 }
 QScrollBar::handle:vertical {
     background: #C0C4CC;
-    border-radius: 4px;
+    border-radius: 8px;
 }
 QScrollBar::handle:vertical:hover {
     background: #909399;
 }
 QListWidget {
     border: 1px solid #E4E7ED;
-    border-radius: 6px;
+    border-radius: 12px;
     background-color: #FFFFFF;
 }
 QListWidget::item {
@@ -98,6 +98,6 @@ QListWidget::item {
 QListWidget::item:selected {
     background-color: #ECF5FF;
     color: #409EFF;
-    border-radius: 4px;
+    border-radius: 10px;
 }
 """

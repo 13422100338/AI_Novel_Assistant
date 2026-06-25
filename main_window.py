@@ -1,22 +1,28 @@
 # main_window.py
 import os
 import docx
+import re
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QTextEdit, QPushButton, QScrollArea, QSplitter, QMessageBox,
                              QFileDialog, QTreeWidget, QTreeWidgetItem, QMenu, QStackedWidget,
-                             QInputDialog, QToolBar, QCheckBox)
+                             QInputDialog, QToolBar, QCheckBox, QGroupBox)
 from PyQt6.QtCore import Qt, QSettings
-from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QTextDocument
+from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QTextDocument, QTextCursor
 from PyQt6.QtPrintSupport import QPrinter
 from data_manager import NovelProject
-from ai_worker import AutoPilotWorker, AIWorker, CorrectionWorker, SummaryWorker,SegmentModifyWorker
+from ai_worker import AutoPilotWorker, AIWorker, CorrectionWorker, SummaryWorker, SegmentModifyWorker, ChapterAnalysisWorker
+from context_builder import NovelContextBuilder
 from ui_components import SettingsDialog, CharacterWidget
+from ui_helpers import CollapsibleSection, render_chat_messages_html
+from model_profiles import get_model_profile
+from novel_memory import NovelMemoryStore
 from PyQt6.QtWidgets import QToolButton, QMenu, QListWidget, QDockWidget # 新增引用
 
 class MainWindow(QMainWindow):
     def __init__(self, project_path):
         super().__init__()
         self.project = NovelProject(project_path)
+        self.memory = NovelMemoryStore(project_path)
         self.settings = QSettings("AIWriter", "Settings")
         self.character_widgets = []
         self.current_vol_index = -1
@@ -24,6 +30,11 @@ class MainWindow(QMainWindow):
         self.switch_project = False
         self.is_generating = False
         self.is_generating_summaries = False  # <--- 新增这行
+        self.import_analysis_queue = []
+        self.analysis_target = None
+        self.last_context_token_estimate = 0
+        self.last_output_token_estimate = 0
+        self.plot_chat_messages = []
 
         self.gen_v_idx = -1  # 正在生成的卷索引
         self.gen_c_idx = -1  # 正在生成的章索引
@@ -65,6 +76,12 @@ class MainWindow(QMainWindow):
             "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #67C23A;")
         btn_export.clicked.connect(self.export_book)
         toolbar.addWidget(btn_export)
+
+        btn_import = QPushButton("📥 导入已有稿件")
+        btn_import.setStyleSheet(
+            "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #409EFF;")
+        btn_import.clicked.connect(self.import_manuscript_files)
+        toolbar.addWidget(btn_import)
 
         toolbar.addSeparator()
 
@@ -119,7 +136,34 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         central_widget = QWidget()
-        central_widget.setStyleSheet("background-color: #FFFFFF;")  # 让主内容区保持白色清爽
+        central_widget.setStyleSheet("""
+            QWidget { background-color: #FFFFFF; color: #1F2937; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }
+            QGroupBox {
+                border: 1px solid #E4E7ED;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding: 8px;
+                font-weight: 600;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QTextEdit, QTreeWidget, QListWidget {
+                border: 1px solid #E4E7ED;
+                border-radius: 12px;
+                background-color: #FAFAFA;
+                selection-background-color: #BFDBFE;
+            }
+            QPushButton, QToolButton {
+                border-radius: 12px;
+                padding: 8px 12px;
+                border: 1px solid #D1D5DB;
+                background-color: #FFFFFF;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background-color: #F3F4F6;
+                border-color: #9CA3AF;
+            }
+            QSplitter::handle { background-color: #EEF2F7; }
+        """)  # 统一第二版界面风格
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -129,8 +173,20 @@ class MainWindow(QMainWindow):
 
         # ====== 左侧：文件树导航 ======
         tree_container = QWidget()
-        tree_layout = QVBoxLayout(tree_container)
-        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_outer_layout = QVBoxLayout(tree_container)
+        tree_outer_layout.setContentsMargins(0, 0, 0, 0)
+        tree_outer_layout.setSpacing(0)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        left_content = QWidget()
+        tree_layout = QVBoxLayout(left_content)
+        tree_layout.setContentsMargins(0, 0, 6, 0)
+        tree_layout.setSpacing(8)
+        left_scroll.setWidget(left_content)
+        tree_outer_layout.addWidget(left_scroll)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabel("📚 小说大纲目录 (右键操作)")
@@ -138,8 +194,17 @@ class MainWindow(QMainWindow):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
         self.tree.itemClicked.connect(self.on_tree_select)
+        self.tree.setMinimumHeight(260)
+        tree_layout.addWidget(self._make_collapsible_section("章节管理", self.tree, True))
 
-        tree_layout.addWidget(self.tree)
+        self.current_character_state = QTextEdit()
+        self.current_character_state.setReadOnly(True)
+        self.current_character_state.setMinimumHeight(180)
+        self.current_character_state.setPlaceholderText("选择章节后，这里显示人物在当前节点的心理、动机、目标和最近行动。")
+        self.current_character_state.setStyleSheet(
+            "background-color: #F8FAFC; border: 1px solid #E4E7ED; border-radius: 8px; padding: 8px; color: #334155;"
+        )
+        tree_layout.addWidget(self._make_collapsible_section("当前节点人物心理", self.current_character_state, True))
 
         # ====== 中间：设定面板区 (Stacked) ======
         self.stacked_widget = QStackedWidget()
@@ -157,6 +222,7 @@ class MainWindow(QMainWindow):
         self.char_list_layout = QVBoxLayout()
         scroll_char = QScrollArea()
         scroll_char.setWidgetResizable(True)
+        scroll_char.setMinimumHeight(260)
         scroll_char.setStyleSheet("border: none;")
         char_container = QWidget()
         char_container.setLayout(self.char_list_layout)
@@ -204,11 +270,64 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.page_global)
         self.stacked_widget.addWidget(self.page_volume)
         self.stacked_widget.addWidget(self.page_chapter)
+        self.stacked_widget.setMinimumHeight(520)
+        tree_layout.addWidget(self._make_collapsible_section("设定 / 细纲 / 人物介绍", self.stacked_widget, True))
+        tree_layout.addStretch()
 
         # ====== 右侧：写作输出区 ======
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(10, 0, 0, 0)
+
+        self.plot_chat_box = QGroupBox("剧情聊天")
+        self.plot_chat_box.setStyleSheet(
+            "QGroupBox { background:#FFFFFF; border:1px solid #E5E7EB; border-radius:18px; "
+            "margin-top:10px; padding:12px; font-weight:700; color:#111827; }"
+            "QGroupBox::title { subcontrol-origin: margin; left:14px; padding:0 6px; }"
+        )
+        plot_layout = QVBoxLayout(self.plot_chat_box)
+        plot_layout.setContentsMargins(12, 18, 12, 12)
+        plot_layout.setSpacing(10)
+        self.plot_chat_output = QTextEdit()
+        self.plot_chat_output.setReadOnly(True)
+        self.plot_chat_output.setAcceptRichText(True)
+        self.plot_chat_output.setPlaceholderText("这里用于和 AI 商讨剧情走向、人物动机、伏笔回收和章节节奏。")
+        self.plot_chat_output.setMinimumHeight(360)
+        self.plot_chat_output.setStyleSheet(
+            "QTextEdit { background-color: #FFFFFF; border: none; border-radius: 14px; padding: 8px; }"
+        )
+        plot_layout.addWidget(self.plot_chat_output)
+
+        plot_input_row = QHBoxLayout()
+        plot_input_row.setSpacing(8)
+        self.plot_chat_input = QTextEdit()
+        self.plot_chat_input.setPlaceholderText("给剧情搭档发消息……")
+        self.plot_chat_input.setFixedHeight(74)
+        self.plot_chat_input.setStyleSheet(
+            "QTextEdit { background:#F9FAFB; border:1px solid #D1D5DB; border-radius:18px; "
+            "padding:12px; color:#111827; }"
+            "QTextEdit:focus { border:1px solid #111827; background:#FFFFFF; }"
+        )
+        self.btn_plot_chat = QPushButton("发送")
+        self.btn_plot_chat.setMinimumWidth(78)
+        self.btn_plot_chat.setStyleSheet(
+            "QPushButton { background:#111827; color:white; border:none; border-radius:18px; "
+            "font-weight:700; padding:12px 16px; }"
+            "QPushButton:hover { background:#374151; }"
+            "QPushButton:disabled { background:#CBD5E1; color:#F8FAFC; }"
+        )
+        self.btn_plot_chat.clicked.connect(self.start_plot_chat)
+        plot_input_row.addWidget(self.plot_chat_input)
+        plot_input_row.addWidget(self.btn_plot_chat)
+        plot_layout.addLayout(plot_input_row)
+        chat_widget = QWidget()
+        chat_layout = QVBoxLayout(chat_widget)
+        chat_layout.setContentsMargins(10, 0, 0, 0)
+        chat_layout.addWidget(self.plot_chat_box)
+        self.chat_context_hint = QLabel("聊天 AI 会读取当前正文编辑区内容、当前章设定和长篇记忆。")
+        self.chat_context_hint.setStyleSheet("color: #64748B; font-size: 12px;")
+        chat_layout.addWidget(self.chat_context_hint)
+        self._render_plot_chat()
 
         # 1. 顶部操作按钮行 (放在同一个水平布局里)
         btn_action_layout = QHBoxLayout()
@@ -216,7 +335,7 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("🚀 根据设定撰写本章")
         self.btn_start.setEnabled(False)  # 必须选中章节才能写
         self.btn_start.setStyleSheet(
-            "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;"
+            "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 16px;"
         )
         self.btn_start.clicked.connect(self.start_generation)
         btn_action_layout.addWidget(self.btn_start)
@@ -226,7 +345,7 @@ class MainWindow(QMainWindow):
         self.btn_chap_correct.setText("🔧 章节一键纠错")
         self.btn_chap_correct.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.btn_chap_correct.setStyleSheet(
-            "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 6px;")
+            "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 16px;")
         self.btn_chap_correct.setEnabled(False)  # 初始化时未选章节不可用
 
         self.chap_correct_menu = QMenu(self)
@@ -239,6 +358,23 @@ class MainWindow(QMainWindow):
         # 将按钮行加入右侧主布局
         right_layout.addLayout(btn_action_layout)
 
+        info_row = QHBoxLayout()
+        self.btn_plot_points = QPushButton("🧭 情节点")
+        self.btn_plot_points.setToolTip("展示 AI 为当前章节整理的关键情节点、伏笔和章节摘要。")
+        self.btn_plot_points.setStyleSheet(
+            "QPushButton { background:#EEF2FF; color:#3730A3; border:1px solid #C7D2FE; "
+            "border-radius:14px; font-weight:700; padding:8px 14px; }"
+            "QPushButton:hover { background:#E0E7FF; }"
+        )
+        self.btn_plot_points.clicked.connect(self.show_current_plot_points)
+        info_row.addWidget(self.btn_plot_points)
+        self.lbl_token_usage = QLabel("Token 估算：上下文 0 / 输出 0")
+        self.lbl_token_usage.setStyleSheet(
+            "color: #64748B; background-color: #F8FAFC; border: 1px solid #E4E7ED; border-radius: 16px; padding: 6px;"
+        )
+        info_row.addWidget(self.lbl_token_usage, 1)
+        right_layout.addLayout(info_row)
+
         # 2. 思考过程显示区
         self.btn_toggle_thinking = QPushButton("🔽 收起思考过程")
         self.btn_toggle_thinking.setStyleSheet(
@@ -249,7 +385,7 @@ class MainWindow(QMainWindow):
         self.thinking_output = QTextEdit()
         self.thinking_output.setReadOnly(True)
         self.thinking_output.setStyleSheet(
-            "background-color: #F8F9FA; color: #8A8F99; border: 1px solid #E4E7ED; border-radius: 6px;")
+            "background-color: #F8F9FA; color: #8A8F99; border: 1px solid #E4E7ED; border-radius: 16px;")
         self.thinking_output.setFixedHeight(120)
         right_layout.addWidget(self.thinking_output)
 
@@ -332,6 +468,23 @@ class MainWindow(QMainWindow):
         mod_layout.addWidget(self.btn_apply_replace)
         self.sidebar_stacked.addWidget(self.modifier_widget)
 
+        # -- 侧边栏 Page 2: 长篇记忆状态 --
+        self.memory_widget = QWidget()
+        memory_layout = QVBoxLayout(self.memory_widget)
+        memory_layout.setContentsMargins(5, 5, 5, 5)
+        memory_layout.addWidget(QLabel("<b>长篇记忆库</b>"))
+        self.memory_dashboard = QTextEdit()
+        self.memory_dashboard.setReadOnly(True)
+        self.memory_dashboard.setPlainText(self.memory.dashboard_text())
+        memory_layout.addWidget(self.memory_dashboard)
+        self.btn_refresh_memory = QPushButton("刷新记忆状态")
+        self.btn_refresh_memory.clicked.connect(self.refresh_memory_dashboard)
+        self.btn_reanalyze_chapter = QPushButton("重新分析当前章")
+        self.btn_reanalyze_chapter.clicked.connect(self.start_reanalyze_current_chapter)
+        memory_layout.addWidget(self.btn_refresh_memory)
+        memory_layout.addWidget(self.btn_reanalyze_chapter)
+        self.sidebar_stacked.addWidget(self.memory_widget)
+
         # -- 最最右侧的竖向按钮柱 (侧边导航栏) --
         vertical_toolbar = QWidget()
         vertical_toolbar.setFixedWidth(46)  # 稍微放宽一点点，避免文字贴边
@@ -345,7 +498,7 @@ class MainWindow(QMainWindow):
                     QPushButton {
                         background-color: transparent;
                         border: none;
-                        border-radius: 4px;
+                        border-radius: 10px;
                         color: #909399;
                         padding: 10px 0;
                         font-size: 13px;
@@ -377,8 +530,14 @@ class MainWindow(QMainWindow):
         self.btn_sidebar_modifier.setFixedSize(40, 80)
         self.btn_sidebar_modifier.clicked.connect(lambda: self.toggle_right_sidebar(1, self.btn_sidebar_modifier))
 
+        self.btn_sidebar_memory = QPushButton("记忆\n库")
+        self.btn_sidebar_memory.setCheckable(True)
+        self.btn_sidebar_memory.setFixedSize(40, 80)
+        self.btn_sidebar_memory.clicked.connect(lambda: self.toggle_right_sidebar(2, self.btn_sidebar_memory))
+
         v_toolbar_layout.addWidget(self.btn_sidebar_log)
         v_toolbar_layout.addWidget(self.btn_sidebar_modifier)
+        v_toolbar_layout.addWidget(self.btn_sidebar_memory)
         v_toolbar_layout.addStretch()  # 把按钮顶在上面
 
         # 重新拼装主视窗
@@ -390,9 +549,12 @@ class MainWindow(QMainWindow):
         right_splitter.setCollapsible(2, False)  # 不允许收起细长工具栏
 
         splitter.addWidget(tree_container)
-        splitter.addWidget(self.stacked_widget)
         splitter.addWidget(right_splitter)
-        splitter.setSizes([200, 250, 950])
+        splitter.addWidget(chat_widget)
+        splitter.setSizes([400, 760, 420])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
 
         # 初始化加载人物
         for char_data in self.project.meta.get("characters", []):
@@ -403,6 +565,236 @@ class MainWindow(QMainWindow):
         shortcut_save.activated.connect(self.save_all)
         shortcut_delete = QShortcut(QKeySequence("Delete"), self.tree)
         shortcut_delete.activated.connect(lambda: self.ui_delete_item(self.tree.currentItem()))
+
+    def _make_collapsible_section(self, title, content_widget, expanded=True):
+        return CollapsibleSection(title, content_widget, expanded)
+
+    def _render_plot_chat(self):
+        if not hasattr(self, "plot_chat_output"):
+            return
+        self.plot_chat_output.setHtml(render_chat_messages_html(self.plot_chat_messages))
+        bar = self.plot_chat_output.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def start_plot_chat(self):
+        question = self.plot_chat_input.toPlainText().strip()
+        if not question:
+            return
+        profile = get_model_profile("chat", self.settings)
+        if not profile.api_key:
+            QMessageBox.warning(self, "缺少 API Key", "请先在设置中配置“剧情商讨模型”的 API Key。")
+            self.open_settings()
+            return
+
+        self.save_all()
+        context = self._current_memory_context()
+        editor_content = self.content_output.toPlainText().strip()
+        if len(editor_content) > 8000:
+            editor_content = "……（当前正文较长，前文省略）……\n" + editor_content[-8000:]
+        system_prompt = (
+            "你是长篇小说剧情策划搭档，负责和作者讨论剧情走向、人物动机、伏笔回收、节奏与冲突。"
+            "你只提供创作建议，不直接替作者改写整章正文，除非作者明确要求。"
+        )
+        user_prompt = f"""
+【小说全局设定】
+{self.project.meta.get('global_synopsis', '')}
+
+【当前章节与长篇记忆】
+{context}
+
+【当前正文编辑区内容】
+{editor_content if editor_content else "当前正文编辑区为空。"}
+
+        【作者问题】
+        {question}
+        """
+        self.update_token_usage(context_text=system_prompt + user_prompt)
+        self.plot_chat_messages.append({"role": "user", "content": question})
+        self.plot_chat_messages.append({"role": "assistant", "content": ""})
+        self._render_plot_chat()
+        self.plot_chat_input.clear()
+        self.btn_plot_chat.setEnabled(False)
+        self.plot_worker = AIWorker(
+            api_key=profile.api_key,
+            base_url=profile.base_url,
+            model=profile.model,
+            temperature=profile.temperature,
+            max_tokens=profile.max_tokens,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        self.plot_worker.content_signal.connect(self.append_plot_chat)
+        self.plot_worker.error_signal.connect(self.handle_error)
+        self.plot_worker.finished_signal.connect(self.plot_chat_finished)
+        self.plot_worker.start()
+
+    def append_plot_chat(self, text):
+        if not self.plot_chat_messages or self.plot_chat_messages[-1].get("role") != "assistant":
+            self.plot_chat_messages.append({"role": "assistant", "content": ""})
+        self.plot_chat_messages[-1]["content"] += text
+        self._render_plot_chat()
+
+    def plot_chat_finished(self):
+        self.btn_plot_chat.setEnabled(True)
+        self._render_plot_chat()
+
+    def refresh_memory_dashboard(self):
+        self.memory_dashboard.setPlainText(self.memory.dashboard_text())
+
+    def _current_memory_context(self):
+        if self.current_vol_index == -1:
+            return self.memory.build_context("", "")
+        vol = self.project.meta["volumes"][self.current_vol_index]
+        chap_name = ""
+        if self.current_chap_index != -1:
+            chap_name = vol["chapters"][self.current_chap_index]["name"]
+        return self.memory.build_context(vol["name"], chap_name)
+
+    def refresh_current_character_state(self):
+        if not hasattr(self, "current_character_state"):
+            return
+        if self.current_vol_index == -1:
+            self.current_character_state.setPlainText(self.memory.character_state_text())
+            return
+        vol = self.project.meta["volumes"][self.current_vol_index]
+        chap_name = ""
+        if self.current_chap_index != -1:
+            chap_name = vol["chapters"][self.current_chap_index]["name"]
+        self.current_character_state.setPlainText(self.memory.character_state_text(vol["name"], chap_name))
+
+    def show_current_plot_points(self):
+        if self.current_vol_index == -1 or self.current_chap_index == -1:
+            QMessageBox.information(self, "情节点", "请先选择一个章节。")
+            return
+        vol = self.project.meta["volumes"][self.current_vol_index]
+        chap = vol["chapters"][self.current_chap_index]
+        text = self.memory.get_plot_points_text(vol["name"], chap["name"])
+        if not text:
+            QMessageBox.information(
+                self,
+                "情节点",
+                "当前章节还没有 AI 情节点记录。\n\n你可以点击“重新分析当前章”，或在导入/生成章节后等待自动分析完成。",
+            )
+            return
+        QMessageBox.information(self, f"情节点 - {chap['name']}", text)
+
+    def estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        ascii_count = sum(1 for ch in text if ord(ch) < 128)
+        non_ascii_count = len(text) - ascii_count
+        return max(1, int(ascii_count / 4 + non_ascii_count / 1.7))
+
+    def update_token_usage(self, context_text: str = "", output_text: str = ""):
+        if context_text:
+            self.last_context_token_estimate = self.estimate_tokens(context_text)
+        if output_text:
+            self.last_output_token_estimate = self.estimate_tokens(output_text)
+        if hasattr(self, "lbl_token_usage"):
+            self.lbl_token_usage.setText(
+                f"Token 估算：上下文 {self.last_context_token_estimate:,} / 输出 {self.last_output_token_estimate:,}"
+            )
+
+    def _start_analysis_for_chapter(self, v_idx, c_idx, status_prefix="正在分析章节记忆"):
+        profile = get_model_profile("draft", self.settings)
+        if not profile.api_key:
+            QMessageBox.warning(self, "缺少 API Key", "请先在设置中配置“正文创作模型”的 API Key。")
+            self.open_settings()
+            return False
+        vol = self.project.meta["volumes"][v_idx]
+        chap = vol["chapters"][c_idx]
+        content = self.project.read_chapter_content(vol["name"], chap["name"])
+        if len(content.strip()) < 50:
+            return False
+        if hasattr(self, "analysis_worker") and self.analysis_worker.isRunning():
+            return False
+        self.analysis_target = (v_idx, c_idx)
+        if hasattr(self, "btn_reanalyze_chapter"):
+            self.btn_reanalyze_chapter.setEnabled(False)
+        self.statusBar().showMessage(f"{status_prefix}：{vol['name']} / {chap['name']}")
+        self.analysis_worker = ChapterAnalysisWorker(
+            profile.api_key,
+            profile.base_url,
+            profile.model,
+            min(profile.temperature, 0.8),
+            vol["name"],
+            chap["name"],
+            content,
+            self.memory.build_context(vol["name"], chap["name"]),
+        )
+        self.analysis_worker.status_signal.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.analysis_worker.analysis_ready_signal.connect(self.apply_chapter_analysis)
+        self.analysis_worker.error_signal.connect(self.handle_error)
+        self.analysis_worker.finished_signal.connect(self.analysis_finished)
+        self.analysis_worker.start()
+        return True
+
+    def start_reanalyze_current_chapter(self):
+        if self.current_vol_index == -1 or self.current_chap_index == -1:
+            QMessageBox.warning(self, "请选择章节", "请先在左侧选择一个已经有正文的章节。")
+            return
+        self.save_all()
+        vol = self.project.meta["volumes"][self.current_vol_index]
+        chap = vol["chapters"][self.current_chap_index]
+        content = self.project.read_chapter_content(vol["name"], chap["name"])
+        if len(content.strip()) < 50:
+            QMessageBox.warning(self, "正文太短", "当前章正文太短，暂时没有足够内容可分析。")
+            return
+        self._start_analysis_for_chapter(self.current_vol_index, self.current_chap_index, "正在重新分析当前章")
+        return
+
+        profile = get_model_profile("draft", self.settings)
+        if not profile.api_key:
+            QMessageBox.warning(self, "缺少 API Key", "请先在设置中配置“正文创作模型”的 API Key。")
+            self.open_settings()
+            return
+
+        self.btn_reanalyze_chapter.setEnabled(False)
+        self.statusBar().showMessage("正在重新分析当前章...")
+        self.analysis_worker = ChapterAnalysisWorker(
+            profile.api_key,
+            profile.base_url,
+            profile.model,
+            min(profile.temperature, 0.8),
+            vol["name"],
+            chap["name"],
+            content,
+            self._current_memory_context(),
+        )
+        self.analysis_worker.status_signal.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.analysis_worker.analysis_ready_signal.connect(self.apply_chapter_analysis)
+        self.analysis_worker.error_signal.connect(self.handle_error)
+        self.analysis_worker.finished_signal.connect(self.analysis_finished)
+        self.analysis_worker.start()
+
+    def apply_chapter_analysis(self, payload):
+        if self.analysis_target:
+            v_idx, c_idx = self.analysis_target
+        else:
+            v_idx, c_idx = self.current_vol_index, self.current_chap_index
+        if v_idx == -1 or c_idx == -1:
+            return
+        vol = self.project.meta["volumes"][v_idx]
+        chap = vol["chapters"][c_idx]
+        self.memory.upsert_analysis(vol["name"], chap["name"], payload)
+        summary = payload.get("summary", "")
+        if summary:
+            chap["ai_synopsis"] = summary
+            self.project.save_meta()
+            if v_idx == self.current_vol_index and c_idx == self.current_chap_index:
+                self.chap_synopsis_input.setPlainText(chap.get("synopsis", ""))
+        self.refresh_memory_dashboard()
+        self.refresh_current_character_state()
+
+    def analysis_finished(self):
+        self.btn_reanalyze_chapter.setEnabled(True)
+        self.analysis_target = None
+        if self.import_analysis_queue:
+            next_v_idx, next_c_idx = self.import_analysis_queue[0]
+            if self._start_analysis_for_chapter(next_v_idx, next_c_idx, "正在分析导入稿件"):
+                self.import_analysis_queue.pop(0)
+                return
+        self.statusBar().showMessage("章节记忆分析完成。", 5000)
 
     # --- UI 辅助与交互逻辑 ---
     def add_character(self, init_data=None):
@@ -451,7 +843,7 @@ class MainWindow(QMainWindow):
             self.btn_start.setEnabled(True)
             self.btn_start.setText("🛑 停止补全总结")
             self.btn_start.setStyleSheet(
-                "font-size: 15px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 12px; border-radius: 6px;")
+                "font-size: 15px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 12px; border-radius: 16px;")
 
             self.btn_auto_pilot.setEnabled(True)
             self.btn_auto_pilot.setText("🛑 停止补全总结")
@@ -474,17 +866,17 @@ class MainWindow(QMainWindow):
             if is_viewing_gen_chapter:
                 self.btn_start.setText("🛑 停止生成 (正在输出当前章)")
                 self.btn_start.setStyleSheet(
-                    "font-size: 15px; font-weight: bold; background-color: #F56C6C; color: white; border: none; padding: 12px; border-radius: 6px;")
+                    "font-size: 15px; font-weight: bold; background-color: #F56C6C; color: white; border: none; padding: 12px; border-radius: 16px;")
             else:
                 self.btn_start.setText("🛑 停止后台生成 (其他章正在码字)")
                 self.btn_start.setStyleSheet(
-                    "font-size: 15px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 12px; border-radius: 6px;")
+                    "font-size: 15px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 12px; border-radius: 16px;")
 
         elif is_auto_piloting:
             self.btn_start.setEnabled(False)
             self.btn_start.setText("🤖 挂机模式进行中...")
             self.btn_start.setStyleSheet(
-                "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;")
+                "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 16px;")
 
             # 把挂机按钮变成红色停止按钮
             self.btn_auto_pilot.setEnabled(True)
@@ -502,12 +894,12 @@ class MainWindow(QMainWindow):
                 self.btn_start.setText("🚀 根据设定撰写本章")
                 self.btn_start.setEnabled(True)
                 self.btn_start.setStyleSheet(
-                    "font-size: 16px; font-weight: bold; background-color: #67C23A; color: white; border: none; padding: 12px; border-radius: 6px;")
+                    "font-size: 16px; font-weight: bold; background-color: #67C23A; color: white; border: none; padding: 12px; border-radius: 16px;")
             else:
                 self.btn_start.setText("🚀 根据设定撰写本章")
                 self.btn_start.setEnabled(False)
                 self.btn_start.setStyleSheet(
-                    "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;")
+                    "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 16px;")
 
             # 恢复挂机按钮
             self.btn_auto_pilot.setEnabled(True)
@@ -560,12 +952,12 @@ class MainWindow(QMainWindow):
             self.btn_chap_correct.setText("🔧 章节一键纠错")
             self.btn_chap_correct.setMenu(self.chap_correct_menu)
             self.btn_chap_correct.setStyleSheet(
-                "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 6px;"
+                "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 16px;"
             )
 
     def start_correction(self, scope, mode):
-        api_key = self.settings.value("api_key", "")
-        if not api_key:
+        profile = get_model_profile("draft", self.settings)
+        if not profile.api_key:
             QMessageBox.warning(self, "错误", "缺少 API Key！")
             return
 
@@ -823,6 +1215,9 @@ class MainWindow(QMainWindow):
                 content = self.project.read_chapter_content(vol_data["name"], chap_data["name"])
                 self.content_output.setText(content)
                 self.thinking_output.clear()
+        self.refresh_current_character_state()
+        if hasattr(self, "content_output"):
+            self.update_token_usage(output_text=self.content_output.toPlainText())
         self.update_ui_state()
 
     def return_to_home(self):
@@ -877,10 +1272,106 @@ class MainWindow(QMainWindow):
                 vol_name = self.project.meta["volumes"][self.current_vol_index]["name"]
                 chap_name = self.project.meta["volumes"][self.current_vol_index]["chapters"][self.current_chap_index][
                     "name"]
-                self.project.save_chapter_content(vol_name, chap_name, self.content_output.toPlainText())
+                new_content = self.content_output.toPlainText()
+                old_content = self.project.read_chapter_content(vol_name, chap_name)
+                if old_content.strip() and old_content != new_content:
+                    self.memory.archive_chapter_version(vol_name, chap_name, old_content, "manual-save")
+                self.project.save_chapter_content(vol_name, chap_name, new_content)
 
         # 无论是快捷键还是切换章节触发，都在底部状态栏提供无感提示
         self.statusBar().showMessage("✅ 小说正文及设定已自动保存！", 3000)
+
+    def import_manuscript_files(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "导入已有稿件",
+            "",
+            "Manuscript Files (*.txt *.docx);;Text Files (*.txt);;Word Files (*.docx)"
+        )
+        if not file_paths:
+            return
+
+        self.save_all()
+        target_v_idx = self._ensure_import_volume()
+        imported = []
+        for path in file_paths:
+            try:
+                text = self._read_import_file(path)
+            except Exception as e:
+                QMessageBox.warning(self, "导入失败", f"无法读取文件：\n{path}\n\n{e}")
+                continue
+            chapters = self._split_imported_text(text, os.path.splitext(os.path.basename(path))[0])
+            for title, content in chapters:
+                chap_name = self._unique_chapter_name(target_v_idx, title)
+                synopsis = "由导入稿件自动创建，等待 AI 生成压缩摘要。"
+                self.project.add_chapter(target_v_idx, chap_name, synopsis=synopsis, ai_synopsis="")
+                c_idx = len(self.project.meta["volumes"][target_v_idx]["chapters"]) - 1
+                self.project.save_chapter_content(self.project.meta["volumes"][target_v_idx]["name"], chap_name, content)
+                imported.append((target_v_idx, c_idx))
+
+        if not imported:
+            return
+        self.refresh_tree()
+        self.import_analysis_queue.extend(imported)
+        QMessageBox.information(
+            self,
+            "导入完成",
+            f"已导入 {len(imported)} 个章节。\n\n系统会自动提取上下文压缩摘要、情节点、人物存档和伏笔账本。"
+        )
+        if not (hasattr(self, "analysis_worker") and self.analysis_worker.isRunning()):
+            next_v_idx, next_c_idx = self.import_analysis_queue[0]
+            if self._start_analysis_for_chapter(next_v_idx, next_c_idx, "正在分析导入稿件"):
+                self.import_analysis_queue.pop(0)
+
+    def _ensure_import_volume(self):
+        for idx, vol in enumerate(self.project.meta["volumes"]):
+            if vol["name"] == "导入稿件":
+                return idx
+        self.project.add_volume("导入稿件", "从 TXT/DOCX 导入的既有稿件。")
+        return len(self.project.meta["volumes"]) - 1
+
+    def _read_import_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".docx":
+            document = docx.Document(path)
+            return "\n".join(p.text for p in document.paragraphs if p.text.strip())
+        for encoding in ("utf-8", "utf-8-sig", "gbk"):
+            try:
+                with open(path, "r", encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+    def _split_imported_text(self, text, fallback_title):
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return []
+        pattern = re.compile(r"(?m)^(第[零一二三四五六七八九十百千万\d]+[章节卷回][^\n]{0,40}|Chapter\s+\d+[^\n]{0,40})\s*$")
+        matches = list(pattern.finditer(text))
+        chapters = []
+        if matches:
+            for idx, match in enumerate(matches):
+                title = match.group(1).strip()
+                start = match.end()
+                end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                content = text[start:end].strip()
+                if content:
+                    chapters.append((title, content))
+        if chapters:
+            return chapters
+        return [(fallback_title or "导入章节", text)]
+
+    def _unique_chapter_name(self, v_idx, base_name):
+        safe = re.sub(r'[\\/:*?"<>|]', "_", (base_name or "导入章节").strip())[:60] or "导入章节"
+        existing = {c["name"] for c in self.project.meta["volumes"][v_idx]["chapters"]}
+        if safe not in existing:
+            return safe
+        counter = 2
+        while f"{safe}-{counter}" in existing:
+            counter += 1
+        return f"{safe}-{counter}"
 
     def export_book(self):
         # 1. 强制保存当前最新进度
@@ -970,8 +1461,54 @@ class MainWindow(QMainWindow):
 
         # 渲染生成 PDF
         document.print(printer)
+
+    def _chapter_position_list(self):
+        positions = []
+        for v_idx, vol in enumerate(self.project.meta["volumes"]):
+            for c_idx, chap in enumerate(vol["chapters"]):
+                positions.append((v_idx, c_idx, vol["name"], chap["name"]))
+        return positions
+
+    def _recent_full_chapters_context(self, v_idx, c_idx, count=3):
+        positions = self._chapter_position_list()
+        try:
+            current_pos = next(i for i, item in enumerate(positions) if item[0] == v_idx and item[1] == c_idx)
+        except StopIteration:
+            return ""
+        recent = positions[max(0, current_pos - count):current_pos]
+        blocks = []
+        for _, _, vol_name, chap_name in recent:
+            content = self.project.read_chapter_content(vol_name, chap_name).strip()
+            if not content:
+                continue
+            # 内部安全阀：保留最近章节的正文风格，但避免单章异常超长拖垮请求。
+            if len(content) > 12000:
+                content = content[-12000:]
+            blocks.append(f"【{vol_name} / {chap_name}】\n{content}")
+        return "\n\n".join(blocks)
+
+    def _compressed_history_before_recent(self, v_idx, c_idx, recent_count=3):
+        positions = self._chapter_position_list()
+        try:
+            current_pos = next(i for i, item in enumerate(positions) if item[0] == v_idx and item[1] == c_idx)
+        except StopIteration:
+            return ""
+        cutoff = max(0, current_pos - recent_count)
+        lines = []
+        for old_v_idx, old_c_idx, vol_name, chap_name in positions[:cutoff]:
+            chap = self.project.meta["volumes"][old_v_idx]["chapters"][old_c_idx]
+            summary = chap.get("ai_synopsis") or chap.get("synopsis") or ""
+            if summary.strip():
+                lines.append(f"- {vol_name} / {chap_name}: {summary.strip()}")
+        return "\n".join(lines)
+
     # --- 核心大模型生成逻辑 (包含复杂的上下文组装) ---
     def build_prompts(self):
+        return NovelContextBuilder(self.project, self.memory).build_prompts(
+            self.current_vol_index,
+            self.current_chap_index,
+        )
+
         meta = self.project.meta
 
         # 1. 组装全局设定
@@ -1048,11 +1585,20 @@ class MainWindow(QMainWindow):
 
         curr_vol = meta["volumes"][v_idx]
         curr_chap = curr_vol["chapters"][c_idx]
+        memory_context = self.memory.build_context(curr_vol["name"], curr_chap["name"])
+        recent_full_context = self._recent_full_chapters_context(v_idx, c_idx, count=3)
+        older_compressed_context = self._compressed_history_before_recent(v_idx, c_idx, recent_count=3)
 
         user_prompt = f"""请为我撰写最新章节的正文。
 
-【过往剧情轨迹参考】
-{history_str.strip()}
+【较早章节压缩轨迹】
+{older_compressed_context.strip() if older_compressed_context.strip() else history_str.strip()}
+
+【最近章节全文，用于保持行文风格、节奏和人物声音】
+{recent_full_context if recent_full_context.strip() else "暂无最近章节全文。"}
+
+【长篇压缩记忆 / 人物状态 / 伏笔正典】
+{memory_context if memory_context.strip() else "暂无结构化长篇记忆。"}
 
 """
         if prev_chapter_content.strip():
@@ -1071,6 +1617,19 @@ class MainWindow(QMainWindow):
                 1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件。
                 2. 人物状态更新：记录本章主角及配角的行为及心态。
                 3. 物品设定更新：记录本章所有物品状态
+            """
+        else:
+            user_prompt += f"""【本次写作任务】
+            当前所处卷：{curr_vol['name']}
+            本卷核心梗概：{curr_vol.get('synopsis', '无')}
+
+            当前需撰写章节：{curr_chap['name']}
+            本章细纲要求：{curr_chap.get('synopsis', '无')}
+
+            【行动指令】
+            请根据全局设定、本卷梗概和本章细纲展开。若这是开篇，请迅速建立人物处境、核心冲突和可持续推进的悬念。
+            严格限定正文长度在2000-3000字之间，确保爽点密集、拒绝水文，扩写为文笔流畅的完整正文！
+            【重要】在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
             """
 
         return system_prompt, user_prompt
@@ -1106,6 +1665,7 @@ class MainWindow(QMainWindow):
     def _execute_start_generation(self):
         """真正的原单章挂机逻辑"""
         system_prompt, user_prompt = self.build_prompts()
+        self.update_token_usage(context_text=system_prompt + user_prompt, output_text="")
 
         self.is_generating = True
         self.gen_v_idx = self.current_vol_index
@@ -1119,13 +1679,9 @@ class MainWindow(QMainWindow):
         self.hit_summary_delimiter = False
         self.update_ui_state()
 
-        base_url = self.settings.value("base_url", "https://api.deepseek.com")
-        model = self.settings.value("model", "deepseek-reasoner")
-        temperature = float(self.settings.value("temperature", 1.5))
-        max_tokens = int(self.settings.value("max_tokens", 6000))
-
-        self.worker = AIWorker(api_key=self.settings.value("api_key", ""), base_url=base_url, model=model,
-                               temperature=temperature, max_tokens=max_tokens, system_prompt=system_prompt,
+        profile = get_model_profile("draft", self.settings)
+        self.worker = AIWorker(api_key=profile.api_key, base_url=profile.base_url, model=profile.model,
+                               temperature=profile.temperature, max_tokens=profile.max_tokens, system_prompt=system_prompt,
                                user_prompt=user_prompt)
         self.worker.reasoning_signal.connect(self.append_thinking)
         self.worker.content_signal.connect(self.append_content)
@@ -1168,12 +1724,8 @@ class MainWindow(QMainWindow):
         self.update_ui_state()
         self.statusBar().showMessage(f"⏳ 发现 {len(tasks)} 个已写章节缺失 AI 总结，正在自动补全以免影响记忆...")
 
-        api_key = self.settings.value("api_key", "")
-        base_url = self.settings.value("base_url", "https://api.deepseek.com")
-        model = self.settings.value("model", "deepseek-reasoner")
-        temp = float(self.settings.value("temperature", 0.7))
-
-        self.summary_worker = SummaryWorker(api_key, base_url, model, temp, tasks)
+        profile = get_model_profile("draft", self.settings)
+        self.summary_worker = SummaryWorker(profile.api_key, profile.base_url, profile.model, profile.temperature, tasks)
         self.summary_worker.status_signal.connect(lambda msg: self.statusBar().showMessage(msg))
         self.summary_worker.summary_ready_signal.connect(self._on_missing_summary_ready)
         self.summary_worker.finished_signal.connect(lambda: self._on_missing_summary_finished(callback))
@@ -1185,6 +1737,9 @@ class MainWindow(QMainWindow):
         chap = self.project.meta["volumes"][v_idx]["chapters"][c_idx]
         chap["ai_synopsis"] = summary
         self.project.save_meta()
+        vol_name = self.project.meta["volumes"][v_idx]["name"]
+        self.memory.upsert_analysis(vol_name, chap["name"], {"summary": summary})
+        self.refresh_memory_dashboard()
 
         # 顺手把 UI 里可能看得到的界面同步一下（如果用户正停留在该章）
         if self.current_vol_index == v_idx and self.current_chap_index == c_idx:
@@ -1223,6 +1778,7 @@ class MainWindow(QMainWindow):
     def append_content(self, text):
         # [cite_start]【关键修复】：实时将 AI 吐出的文字拼接到后台缓冲区中 [cite: 196]
         self.gen_content_buffer += text
+        self.update_token_usage(output_text=self.gen_content_buffer.split("[AI_SUMMARY]")[0])
 
         if "[AI_SUMMARY]" in self.gen_content_buffer:
             if not getattr(self, 'hit_summary_delimiter', False):
@@ -1264,12 +1820,17 @@ class MainWindow(QMainWindow):
             ai_summary = parts[1].strip() if len(parts) > 1 else ""
 
             # 1. 保存纯净的正文到 docx
+            old_content = self.project.read_chapter_content(vol_name, chap_name)
+            if old_content.strip() and old_content != main_content:
+                self.memory.archive_chapter_version(vol_name, chap_name, old_content, "ai-generation")
             self.project.save_chapter_content(vol_name, chap_name, main_content)
 
             # 2. 如果成功生成了 AI 总结，将其隐式保存到 meta 并在后台落盘
             if ai_summary:
                 chap_data["ai_synopsis"] = ai_summary
                 self.project.save_meta()
+                self.memory.upsert_analysis(vol_name, chap_name, {"summary": ai_summary})
+                self.refresh_memory_dashboard()
 
             # 3. 如果用户还停留在这个章节，确保文本框里显示的是纯净的、没有尾巴的正文
             if self.current_vol_index == self.gen_v_idx and self.current_chap_index == self.gen_c_idx:
@@ -1428,11 +1989,16 @@ class MainWindow(QMainWindow):
         chap_name = self.project.meta["volumes"][v_idx]["chapters"][c_idx]["name"]
 
         # 保存本地 docx
+        old_content = self.project.read_chapter_content(vol_name, chap_name)
+        if old_content.strip() and old_content != main_content:
+            self.memory.archive_chapter_version(vol_name, chap_name, old_content, "auto-pilot")
         self.project.save_chapter_content(vol_name, chap_name, main_content)
         # 更新 meta 中的 AI 总结
         if ai_summary:
             self.project.meta["volumes"][v_idx]["chapters"][c_idx]["ai_synopsis"] = ai_summary
             self.project.save_meta()
+            self.memory.upsert_analysis(vol_name, chap_name, {"summary": ai_summary})
+            self.refresh_memory_dashboard()
 
         # 【关键修复】：取消这行 clear()，将清理工作交给 on_tree_select 去自然过渡
         self.hit_summary_delimiter = False
@@ -1461,6 +2027,8 @@ class MainWindow(QMainWindow):
             self.sidebar_stacked.show()
             self.btn_sidebar_log.setChecked(page_index == 0)
             self.btn_sidebar_modifier.setChecked(page_index == 1)
+            if hasattr(self, "btn_sidebar_memory"):
+                self.btn_sidebar_memory.setChecked(page_index == 2)
 
     def show_editor_context_menu(self, pos):
         # 调用 PyQt 原生的富文本标准菜单
@@ -1486,6 +2054,8 @@ class MainWindow(QMainWindow):
         self.sidebar_stacked.show()
         self.btn_sidebar_modifier.setChecked(True)
         self.btn_sidebar_log.setChecked(False)
+        if hasattr(self, "btn_sidebar_memory"):
+            self.btn_sidebar_memory.setChecked(False)
 
         # 3. 数据灌入
         self.mod_selected_text.setPlainText(selected_text)

@@ -988,3 +988,94 @@ class SegmentModifyWorker(QThread):
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
+
+
+class ChapterAnalysisWorker(QThread):
+    status_signal = pyqtSignal(str)
+    analysis_ready_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, api_key, base_url, model, temperature, volume_name, chapter_name, content, extra_context=""):
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.volume_name = volume_name
+        self.chapter_name = chapter_name
+        self.content = content
+        self.extra_context = extra_context
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, 'client'):
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self.status_signal.emit(f"正在分析章节记忆：{self.volume_name} / {self.chapter_name}")
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            sys_prompt = (
+                "你是长篇小说的正典编辑和连续性管理员。"
+                "你的任务是从章节正文中提取可供百万字长篇持续写作使用的结构化记忆。"
+                "不要机械压缩到固定比例；请自行判断信息密度，保留后续创作真正需要的主线进展、人物成长、心理变化、伏笔承诺、世界规则和行文风格锚点。"
+                "必须返回严格 JSON，不要输出 Markdown。"
+            )
+            user_prompt = f"""
+【当前卷】{self.volume_name}
+【当前章】{self.chapter_name}
+
+【已有压缩上下文，可用于避免重复记录】
+{self.extra_context}
+
+【章节正文】
+{self.content}
+
+请返回 JSON 对象，字段如下：
+{{
+  "summary": "由你自行决定信息密度的章节摘要，必须保留主线、冲突、结尾钩子、风格锚点和后续会用到的信息",
+  "plot_points": ["本章发生的关键剧情节点"],
+  "character_updates": [
+    {{
+      "name": "人物名",
+      "motivation": "当前动机",
+      "psychology": "当前心理",
+      "current_goal": "最近目标",
+      "relationships": "关系变化",
+      "recent_activity": "本章活动"
+    }}
+  ],
+  "foreshadows": [
+    {{"title": "伏笔标题", "detail": "伏笔内容", "status": "active"}}
+  ],
+  "canon_facts": [
+    {{"title": "正典事实标题", "detail": "不可随意推翻的事实", "status": "active"}}
+  ]
+}}
+"""
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=self.temperature,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+            )
+            if self._is_cancelled:
+                return
+            content = response.choices[0].message.content.strip()
+            fence = chr(96) * 3
+            if content.startswith(fence + "json"):
+                content = content[7:]
+            if content.endswith(fence):
+                content = content[:-3]
+            self.analysis_ready_signal.emit(json.loads(content))
+            self.finished_signal.emit()
+        except Exception as e:
+            self.error_signal.emit(str(e))
