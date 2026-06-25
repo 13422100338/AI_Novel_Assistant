@@ -24,7 +24,8 @@
   - 动态加入人物状态、伏笔和重要事实
 - 导入已有稿件
   - 支持 TXT / DOCX
-  - 自动拆分章节
+  - 支持 `#第X章标题` / `（第X章 完）` 原稿格式
+  - 可调用稿件整理 Agent 自动判断卷结构并归类章节
   - 自动分析情节点、人物状态和压缩摘要
 - 导出
   - DOCX
@@ -92,6 +93,7 @@ dist/AI_Novel_Assistant/AI_Novel_Assistant.exe
 main.py                 应用入口
 main_window.py          主窗口与主要工作流
 context_builder.py      长篇上下文组装策略
+import_agent.py         原稿章节识别、智能分卷提示与导入计划校验
 novel_memory.py         SQLite 长篇记忆系统
 model_profiles.py       双模型配置
 ai_worker.py            后台 AI 调用与分析任务

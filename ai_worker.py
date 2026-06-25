@@ -2,6 +2,7 @@
 from PyQt6.QtCore import QThread, pyqtSignal
 from openai import OpenAI
 import json
+from import_agent import import_plan_prompt, normalize_import_plan
 
 class AIWorker(QThread):
     reasoning_signal = pyqtSignal(str)
@@ -985,6 +986,63 @@ class SegmentModifyWorker(QThread):
                 if content:
                     self.content_signal.emit(content)
 
+            self.finished_signal.emit()
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class ManuscriptStructureWorker(QThread):
+    status_signal = pyqtSignal(str)
+    plan_ready_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, api_key, base_url, model, temperature, chapters):
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.chapters = chapters
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, "client"):
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self.status_signal.emit("正在让稿件整理 Agent 判断卷章结构...")
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=min(float(self.temperature), 0.4),
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是严谨的长篇小说稿件整理 Agent，只负责分卷和结构判断。"
+                            "必须返回严格 JSON，且不得遗漏、重复或改写章节 id。"
+                        ),
+                    },
+                    {"role": "user", "content": import_plan_prompt(self.chapters)},
+                ],
+            )
+            if self._is_cancelled:
+                return
+            content = response.choices[0].message.content.strip()
+            fence = chr(96) * 3
+            if content.startswith(fence + "json"):
+                content = content[7:]
+            if content.endswith(fence):
+                content = content[:-3]
+            plan = normalize_import_plan(json.loads(content), self.chapters)
+            self.plan_ready_signal.emit(plan)
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))

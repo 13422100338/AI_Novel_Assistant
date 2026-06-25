@@ -10,8 +10,9 @@ from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QTextDocument, QTextCursor
 from PyQt6.QtPrintSupport import QPrinter
 from data_manager import NovelProject
-from ai_worker import AutoPilotWorker, AIWorker, CorrectionWorker, SummaryWorker, SegmentModifyWorker, ChapterAnalysisWorker
+from ai_worker import AutoPilotWorker, AIWorker, CorrectionWorker, SummaryWorker, SegmentModifyWorker, ChapterAnalysisWorker, ManuscriptStructureWorker
 from context_builder import NovelContextBuilder
+from import_agent import ImportedChapter, fallback_volume_plan, normalize_import_plan, parse_hash_chapter_manuscript
 from ui_components import SettingsDialog, CharacterWidget
 from ui_helpers import CollapsibleSection, render_chat_messages_html
 from model_profiles import get_model_profile
@@ -35,6 +36,7 @@ class MainWindow(QMainWindow):
         self.last_context_token_estimate = 0
         self.last_output_token_estimate = 0
         self.plot_chat_messages = []
+        self.pending_import_chapters = []
 
         self.gen_v_idx = -1  # 正在生成的卷索引
         self.gen_c_idx = -1  # 正在生成的章索引
@@ -1292,31 +1294,101 @@ class MainWindow(QMainWindow):
             return
 
         self.save_all()
-        target_v_idx = self._ensure_import_volume()
-        imported = []
+        imported_chapters = []
         for path in file_paths:
             try:
                 text = self._read_import_file(path)
             except Exception as e:
                 QMessageBox.warning(self, "导入失败", f"无法读取文件：\n{path}\n\n{e}")
                 continue
-            chapters = self._split_imported_text(text, os.path.splitext(os.path.basename(path))[0])
-            for title, content in chapters:
-                chap_name = self._unique_chapter_name(target_v_idx, title)
-                synopsis = "由导入稿件自动创建，等待 AI 生成压缩摘要。"
-                self.project.add_chapter(target_v_idx, chap_name, synopsis=synopsis, ai_synopsis="")
-                c_idx = len(self.project.meta["volumes"][target_v_idx]["chapters"]) - 1
-                self.project.save_chapter_content(self.project.meta["volumes"][target_v_idx]["name"], chap_name, content)
-                imported.append((target_v_idx, c_idx))
 
-        if not imported:
+            source_file = os.path.basename(path)
+            smart_chapters = parse_hash_chapter_manuscript(text, source_file)
+            if smart_chapters:
+                offset = len(imported_chapters)
+                for chapter in smart_chapters:
+                    chapter.id = offset + chapter.id
+                imported_chapters.extend(smart_chapters)
+            else:
+                # 兼容旧导入逻辑：不是用户指定格式时，仍可粗略导入。
+                for title, content in self._split_imported_text(text, os.path.splitext(source_file)[0]):
+                    imported_chapters.append(
+                        ImportedChapter(
+                            id=len(imported_chapters) + 1,
+                            source_file=source_file,
+                            title=title,
+                            content=content,
+                        )
+                    )
+
+        if not imported_chapters:
             return
+
+        self.pending_import_chapters = imported_chapters
+        profile = get_model_profile("draft", self.settings)
+        if not profile.api_key:
+            plan = fallback_volume_plan(imported_chapters)
+            self._apply_manuscript_import_plan(plan, used_agent=False)
+            return
+
+        self.statusBar().showMessage("正在分析原稿章节和卷结构...")
+        self.structure_worker = ManuscriptStructureWorker(
+            profile.api_key,
+            profile.base_url,
+            profile.model,
+            min(profile.temperature, 0.4),
+            imported_chapters,
+        )
+        self.structure_worker.status_signal.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.structure_worker.plan_ready_signal.connect(self.apply_manuscript_structure_plan)
+        self.structure_worker.error_signal.connect(self.smart_import_failed)
+        self.structure_worker.finished_signal.connect(lambda: self.statusBar().showMessage("稿件结构识别完成。", 5000))
+        self.structure_worker.start()
+
+    def apply_manuscript_structure_plan(self, plan):
+        self._apply_manuscript_import_plan(plan, used_agent=True)
+
+    def smart_import_failed(self, err_msg):
+        QMessageBox.warning(
+            self,
+            "智能分卷失败",
+            f"稿件整理 Agent 调用失败，将按默认单卷导入。\n\n错误信息：\n{err_msg}"
+        )
+        self._apply_manuscript_import_plan(fallback_volume_plan(self.pending_import_chapters), used_agent=False)
+
+    def _apply_manuscript_import_plan(self, plan, used_agent=True):
+        chapters_by_id = {chapter.id: chapter for chapter in self.pending_import_chapters}
+        plan = normalize_import_plan(plan, self.pending_import_chapters)
+        imported = []
+
+        for volume in plan.get("volumes", []):
+            vol_name = self._unique_volume_name(volume.get("title") or "导入稿件")
+            self.project.add_volume(vol_name, volume.get("synopsis", "由智能导入创建的卷。"))
+            v_idx = len(self.project.meta["volumes"]) - 1
+
+            for chapter_id in volume.get("chapters", []):
+                chapter = chapters_by_id.get(int(chapter_id))
+                if not chapter:
+                    continue
+                chap_name = self._unique_chapter_name(v_idx, chapter.title)
+                synopsis = "由智能导入创建，等待 AI 生成压缩摘要。"
+                self.project.add_chapter(v_idx, chap_name, synopsis=synopsis, ai_synopsis="")
+                c_idx = len(self.project.meta["volumes"][v_idx]["chapters"]) - 1
+                self.project.save_chapter_content(vol_name, chap_name, chapter.content)
+                imported.append((v_idx, c_idx))
+
+        self.pending_import_chapters = []
+        if not imported:
+            QMessageBox.warning(self, "导入失败", "没有成功写入任何章节，请检查原稿格式。")
+            return
+
         self.refresh_tree()
         self.import_analysis_queue.extend(imported)
+        mode_text = "稿件整理 Agent 已完成卷章划分" if used_agent else "未启用模型分卷，已按默认单卷导入"
         QMessageBox.information(
             self,
             "导入完成",
-            f"已导入 {len(imported)} 个章节。\n\n系统会自动提取上下文压缩摘要、情节点、人物存档和伏笔账本。"
+            f"{mode_text}。\n\n已导入 {len(plan.get('volumes', []))} 卷、{len(imported)} 章。\n系统会继续自动提取摘要、情节点、人物存档和伏笔账本。"
         )
         if not (hasattr(self, "analysis_worker") and self.analysis_worker.isRunning()):
             next_v_idx, next_c_idx = self.import_analysis_queue[0]
@@ -1329,6 +1401,16 @@ class MainWindow(QMainWindow):
                 return idx
         self.project.add_volume("导入稿件", "从 TXT/DOCX 导入的既有稿件。")
         return len(self.project.meta["volumes"]) - 1
+
+    def _unique_volume_name(self, base_name):
+        safe = re.sub(r'[\\/:*?"<>|]', "_", (base_name or "导入稿件").strip())[:60] or "导入稿件"
+        existing = {v["name"] for v in self.project.meta["volumes"]}
+        if safe not in existing:
+            return safe
+        counter = 2
+        while f"{safe}-{counter}" in existing:
+            counter += 1
+        return f"{safe}-{counter}"
 
     def _read_import_file(self, path):
         ext = os.path.splitext(path)[1].lower()
