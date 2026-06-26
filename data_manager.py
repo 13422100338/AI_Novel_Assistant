@@ -72,12 +72,73 @@ class NovelProject:
         self.save_meta()
 
     def delete_volume(self, v_idx):
-        vol_name = self.meta["volumes"][v_idx]["name"]
-        vol_path = os.path.join(self.root_path, vol_name)
-        if os.path.exists(vol_path):
-            shutil.rmtree(vol_path)
+        if v_idx < 0 or v_idx >= len(self.meta["volumes"]):
+            return None
+
+        source_vol = self.meta["volumes"][v_idx]
+        source_name = source_vol["name"]
+        source_path = os.path.join(self.root_path, source_name)
+
+        chapters_to_move = list(source_vol.get("chapters", []))
+        target_idx = self._volume_delete_target_index(v_idx)
+
+        # 如果这是唯一一个卷且里面有章节，先创建一个兜底卷承接章节。
+        if target_idx is None and chapters_to_move:
+            fallback_name = self._unique_volume_name("未分卷章节")
+            fallback_path = os.path.join(self.root_path, fallback_name)
+            os.makedirs(fallback_path, exist_ok=True)
+            self.meta["volumes"].append({"name": fallback_name, "synopsis": "删除原卷时自动承接的章节。", "chapters": []})
+            target_idx = len(self.meta["volumes"]) - 1
+
+        if target_idx is not None and chapters_to_move:
+            target_vol = self.meta["volumes"][target_idx]
+            target_name = target_vol["name"]
+            target_path = os.path.join(self.root_path, target_name)
+            os.makedirs(target_path, exist_ok=True)
+
+            for chap in chapters_to_move:
+                old_chap_name = chap["name"]
+                new_chap_name = self._unique_chapter_name_in_volume(target_idx, old_chap_name)
+                old_path = os.path.join(source_path, f"{old_chap_name}.docx")
+                new_path = os.path.join(target_path, f"{new_chap_name}.docx")
+                if os.path.exists(old_path):
+                    shutil.move(old_path, new_path)
+                moved_chap = dict(chap)
+                moved_chap["name"] = new_chap_name
+                target_vol["chapters"].append(moved_chap)
+
+        # 删除源卷元数据。如果刚创建兜底卷，它的位置可能在源卷之后；删除源卷后无需额外修正。
         del self.meta["volumes"][v_idx]
+
+        if os.path.exists(source_path):
+            shutil.rmtree(source_path)
         self.save_meta()
+        return target_idx
+
+    def _volume_delete_target_index(self, v_idx):
+        if len(self.meta["volumes"]) <= 1:
+            return None
+        if v_idx > 0:
+            return v_idx - 1
+        return 1
+
+    def _unique_volume_name(self, base_name):
+        existing = {v["name"] for v in self.meta["volumes"]}
+        if base_name not in existing:
+            return base_name
+        counter = 2
+        while f"{base_name}-{counter}" in existing:
+            counter += 1
+        return f"{base_name}-{counter}"
+
+    def _unique_chapter_name_in_volume(self, v_idx, base_name):
+        existing = {c["name"] for c in self.meta["volumes"][v_idx].get("chapters", [])}
+        if base_name not in existing:
+            return base_name
+        counter = 2
+        while f"{base_name}-{counter}" in existing:
+            counter += 1
+        return f"{base_name}-{counter}"
 
     def delete_chapter(self, v_idx, c_idx):
         vol_name = self.meta["volumes"][v_idx]["name"]

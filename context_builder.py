@@ -84,7 +84,15 @@ class NovelContextBuilder:
                 return True
         return False
 
-    def build_prompts(self, v_idx: int, c_idx: int):
+    def build_prompts(
+        self,
+        v_idx: int,
+        c_idx: int,
+        generation_mode: str = "rewrite",
+        existing_content: str = "",
+        selected_text: str = "",
+        expand_instruction: str = "",
+    ):
         meta = self.project.meta
         global_story = meta.get("global_synopsis", "未提供。")
         char_texts = [
@@ -111,7 +119,17 @@ class NovelContextBuilder:
 
         curr_vol = meta["volumes"][v_idx]
         curr_chap = curr_vol["chapters"][c_idx]
-        memory_context = self.memory.build_context(curr_vol["name"], curr_chap["name"])
+        relevance_query = "\n".join([
+            curr_vol.get("synopsis", ""),
+            curr_chap.get("synopsis", ""),
+            existing_content[-4000:] if existing_content else "",
+            selected_text,
+            expand_instruction,
+        ])
+        if hasattr(self.memory, "build_relevant_context"):
+            memory_context = self.memory.build_relevant_context(curr_vol["name"], curr_chap["name"], relevance_query)
+        else:
+            memory_context = self.memory.build_context(curr_vol["name"], curr_chap["name"])
         recent_full_context = self.recent_full_chapters_context(v_idx, c_idx)
         older_compressed_context = self.compressed_history_before_recent(v_idx, c_idx)
         history_context = older_compressed_context.strip() or self.legacy_history(v_idx, c_idx)
@@ -136,7 +154,30 @@ class NovelContextBuilder:
 
 【行动指令】
 """
-        if self.has_previous_chapter(v_idx, c_idx):
+        if generation_mode == "continue":
+            user_prompt += f"""续写当前章。请把下面【当前章已有正文】视为已经定稿的前半段，不要重复已有正文，不要从头重写。
+
+【当前章已有正文】
+{existing_content.strip() if existing_content.strip() else "当前章正文区为空。"}
+
+请从已有正文的最后一句自然接续，继续推进本章剧情；保持同一章内的叙事视角、人物声音和行文节奏。
+输出时只输出新增续写内容，最后仍需另起一行输出 `[AI_SUMMARY]`，摘要应概括“已有正文 + 新增续写”形成的完整当前章。
+"""
+        elif generation_mode == "expand_selection":
+            user_prompt += f"""局部扩写当前选中片段。你不是在重写整章，而是在扩写/润色选区，使它更细腻、更有画面感，并与上下文自然衔接。
+
+【当前章已有正文】
+{existing_content.strip() if existing_content.strip() else "当前章正文区为空。"}
+
+【需要扩写的选中片段】
+{selected_text.strip() if selected_text.strip() else "未选中文本。"}
+
+【扩写要求】
+{expand_instruction.strip() if expand_instruction.strip() else "在不改变核心事实的前提下，增加心理、动作、环境和节奏层次。"}
+
+请只输出扩写后的选中片段，不要输出整章，不要输出解释，不要输出 `[AI_SUMMARY]`。
+"""
+        elif self.has_previous_chapter(v_idx, c_idx):
             user_prompt += """请根据本章细纲要求，顺着上一章的情节展开。
 严格限定正文长度在2000-3000字之间，确保爽点密集、拒绝水文，扩写为文笔流畅的完整正文！
 """
@@ -144,7 +185,8 @@ class NovelContextBuilder:
             user_prompt += """请根据全局设定、本卷梗概和本章细纲展开。若这是开篇，请迅速建立人物处境、核心冲突和可持续推进的悬念。
 严格限定正文长度在2000-3000字之间，确保爽点密集、拒绝水文，扩写为文笔流畅的完整正文！
 """
-        user_prompt += """【重要】在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
+        if generation_mode != "expand_selection":
+            user_prompt += """【重要】在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
 在 `[AI_SUMMARY]` 之后，必须严格按照以下3个维度输出：
 1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件。
 2. 人物状态更新：记录本章主角及配角的行为及心态。

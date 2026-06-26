@@ -26,7 +26,14 @@
   - 支持 TXT / DOCX
   - 支持 `#第X章标题` / `（第X章 完）` 原稿格式
   - 可调用稿件整理 Agent 自动判断卷结构并归类章节
+  - 可在设置中关闭“智能导入时自动分卷”，仅保留自动分章节
   - 自动分析情节点、人物状态和压缩摘要
+- 安全卷管理
+  - 删除卷时，卷内章节会自动归并到上一卷；没有上一卷时会归并到下一卷或“未分卷章节”
+- API 配置
+  - 支持 OpenAI-compatible Base URL
+  - 可填写第三方中转站地址
+  - 支持从兼容 `/v1/models` 的服务获取模型列表并选择模型
 - 导出
   - DOCX
   - Markdown
@@ -94,6 +101,10 @@ main.py                 应用入口
 main_window.py          主窗口与主要工作流
 context_builder.py      长篇上下文组装策略
 import_agent.py         原稿章节识别、智能分卷提示与导入计划校验
+manuscript_import_service.py  TXT/DOCX 读取、粗拆章、导入落盘服务
+book_exporter.py        DOCX/TXT/Markdown/PDF 导出服务
+character_state_editor.py 人物状态编辑文本的格式化与解析
+text_metrics.py         Token/文本长度估算工具
 novel_memory.py         SQLite 长篇记忆系统
 model_profiles.py       双模型配置
 ai_worker.py            后台 AI 调用与分析任务

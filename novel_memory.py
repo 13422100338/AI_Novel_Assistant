@@ -108,6 +108,183 @@ class NovelMemoryStore:
         )
         self.conn.commit()
 
+    def _row_to_dict(self, row):
+        return dict(row) if row else None
+
+    def list_character_states(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT name, motivation, psychology, current_goal, relationships, recent_activity, last_seen, updated_at
+            FROM character_states
+            ORDER BY updated_at DESC, name ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_character_state(self, name: str) -> dict | None:
+        row = self.conn.execute(
+            """
+            SELECT name, motivation, psychology, current_goal, relationships, recent_activity, last_seen, updated_at
+            FROM character_states
+            WHERE name=?
+            """,
+            (name,),
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    def update_character_state(self, name: str, fields: dict):
+        if not name.strip():
+            return
+        existing = self.get_character_state(name) or {}
+        merged = {
+            "motivation": fields.get("motivation", existing.get("motivation", "")),
+            "psychology": fields.get("psychology", existing.get("psychology", "")),
+            "current_goal": fields.get("current_goal", existing.get("current_goal", "")),
+            "relationships": fields.get("relationships", existing.get("relationships", "")),
+            "recent_activity": fields.get("recent_activity", existing.get("recent_activity", "")),
+            "last_seen": fields.get("last_seen", existing.get("last_seen", "")),
+        }
+        self.conn.execute(
+            """
+            INSERT INTO character_states
+                (name, motivation, psychology, current_goal, relationships, recent_activity, last_seen, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                motivation=excluded.motivation,
+                psychology=excluded.psychology,
+                current_goal=excluded.current_goal,
+                relationships=excluded.relationships,
+                recent_activity=excluded.recent_activity,
+                last_seen=excluded.last_seen,
+                updated_at=excluded.updated_at
+            """,
+            (
+                name.strip(),
+                merged["motivation"],
+                merged["psychology"],
+                merged["current_goal"],
+                merged["relationships"],
+                merged["recent_activity"],
+                merged["last_seen"],
+                self.now(),
+            ),
+        )
+        self.conn.commit()
+
+    def delete_character_state(self, name: str):
+        self.conn.execute("DELETE FROM character_states WHERE name=?", (name,))
+        self.conn.commit()
+
+    def list_layered_summaries(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, level, scope_key, summary, updated_at
+            FROM layered_summaries
+            ORDER BY CASE level WHEN 'book' THEN 0 WHEN 'volume' THEN 1 ELSE 2 END, scope_key
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_layered_summary(self, row_id: int, summary: str):
+        self.conn.execute(
+            "UPDATE layered_summaries SET summary=?, updated_at=? WHERE id=?",
+            (summary, self.now(), row_id),
+        )
+        self.conn.commit()
+
+    def list_chapter_memories(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, volume_name, chapter_name, summary, plot_points, character_updates, foreshadows, updated_at
+            FROM chapter_summaries
+            ORDER BY id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_chapter_memory(self, row_id: int, fields: dict):
+        existing = self.conn.execute(
+            """
+            SELECT summary, plot_points, character_updates, foreshadows
+            FROM chapter_summaries
+            WHERE id=?
+            """,
+            (row_id,),
+        ).fetchone()
+        if not existing:
+            return
+
+        def as_json_text(value, fallback):
+            if value is None:
+                return fallback
+            if isinstance(value, str):
+                return value
+            return json.dumps(value, ensure_ascii=False)
+
+        self.conn.execute(
+            """
+            UPDATE chapter_summaries
+            SET summary=?, plot_points=?, character_updates=?, foreshadows=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                fields.get("summary", existing["summary"]),
+                as_json_text(fields.get("plot_points"), existing["plot_points"]),
+                as_json_text(fields.get("character_updates"), existing["character_updates"]),
+                as_json_text(fields.get("foreshadows"), existing["foreshadows"]),
+                self.now(),
+                row_id,
+            ),
+        )
+        self.rebuild_layered_summaries()
+        self.conn.commit()
+
+    def list_canon_entries(self, include_closed: bool = False) -> list[dict]:
+        where = "" if include_closed else "WHERE status != 'closed'"
+        rows = self.conn.execute(
+            f"""
+            SELECT id, kind, title, detail, status, source_volume, source_chapter, updated_at
+            FROM canon_entries
+            {where}
+            ORDER BY id DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_canon_entry(self, row_id: int, fields: dict):
+        existing = self.conn.execute(
+            """
+            SELECT kind, title, detail, status, source_volume, source_chapter
+            FROM canon_entries
+            WHERE id=?
+            """,
+            (row_id,),
+        ).fetchone()
+        if not existing:
+            return
+        self.conn.execute(
+            """
+            UPDATE canon_entries
+            SET kind=?, title=?, detail=?, status=?, source_volume=?, source_chapter=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                fields.get("kind", existing["kind"]),
+                fields.get("title", existing["title"]),
+                fields.get("detail", existing["detail"]),
+                fields.get("status", existing["status"]),
+                fields.get("source_volume", existing["source_volume"]),
+                fields.get("source_chapter", existing["source_chapter"]),
+                self.now(),
+                row_id,
+            ),
+        )
+        self.conn.commit()
+
+    def delete_canon_entry(self, row_id: int):
+        self.conn.execute("DELETE FROM canon_entries WHERE id=?", (row_id,))
+        self.conn.commit()
+
     def upsert_analysis(self, volume_name: str, chapter_name: str, payload: dict):
         now = self.now()
         summary = payload.get("summary", "")
@@ -285,6 +462,97 @@ class NovelMemoryStore:
                 for r in canon
             ))
         return "\n\n".join(parts)
+
+    def build_relevant_context(self, volume_name: str, chapter_name: str, query: str, limit_recent: int = 8) -> str:
+        """Build context with character/canon rows roughly ranked by current-task relevance."""
+        cur = self.conn.cursor()
+        book = cur.execute(
+            "SELECT summary FROM layered_summaries WHERE level='book' AND scope_key='all'"
+        ).fetchone()
+        volume = cur.execute(
+            "SELECT summary FROM layered_summaries WHERE level='volume' AND scope_key=?",
+            (volume_name,),
+        ).fetchone()
+        recent = cur.execute(
+            """
+            SELECT volume_name, chapter_name, summary
+            FROM chapter_summaries
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit_recent,),
+        ).fetchall()
+        characters = cur.execute(
+            """
+            SELECT name, motivation, psychology, current_goal, relationships, recent_activity, last_seen, updated_at
+            FROM character_states
+            ORDER BY updated_at DESC
+            LIMIT 80
+            """
+        ).fetchall()
+        canon = cur.execute(
+            """
+            SELECT kind, title, detail, status, source_volume, source_chapter, updated_at
+            FROM canon_entries
+            WHERE status != 'closed'
+            ORDER BY id DESC
+            LIMIT 160
+            """
+        ).fetchall()
+
+        def score_row(row, fields):
+            text = " ".join(str(row[f] or "") for f in fields)
+            score = 0
+            for token in self._query_tokens(query):
+                if token and token in text:
+                    score += 3 if len(token) > 1 else 1
+            last_seen = str(row["last_seen"] if "last_seen" in row.keys() else "")
+            if volume_name and volume_name in last_seen:
+                score += 1
+            return score
+
+        ranked_characters = sorted(
+            characters,
+            key=lambda r: (score_row(r, ["name", "motivation", "psychology", "current_goal", "relationships", "recent_activity", "last_seen"]), r["updated_at"]),
+            reverse=True,
+        )[:30]
+        ranked_canon = sorted(
+            canon,
+            key=lambda r: (score_row(r, ["title", "detail", "source_volume", "source_chapter"]), r["updated_at"]),
+            reverse=True,
+        )[:80]
+
+        parts = []
+        if book and book["summary"].strip():
+            parts.append("【全书压缩记忆】\n" + book["summary"].strip())
+        if volume and volume["summary"].strip():
+            parts.append("【当前卷压缩记忆】\n" + volume["summary"].strip())
+        if recent:
+            parts.append("【最近章节摘要】\n" + "\n".join(
+                f"- {r['volume_name']} / {r['chapter_name']}: {r['summary']}" for r in reversed(recent)
+            ))
+        if ranked_characters:
+            parts.append("【人物状态库（按当前章相关度优先）】\n" + "\n".join(
+                f"- {r['name']}｜动机:{r['motivation']}｜心理:{r['psychology']}｜目标:{r['current_goal']}｜关系:{r['relationships']}｜最近:{r['recent_activity']}｜最后出场:{r['last_seen']}"
+                for r in ranked_characters
+            ))
+        if ranked_canon:
+            parts.append("【正典账本 / 伏笔与硬事实（按当前章相关度优先）】\n" + "\n".join(
+                f"- [{r['kind']}/{r['status']}] {r['title']}: {r['detail']}（来源:{r['source_volume']}/{r['source_chapter']}）"
+                for r in ranked_canon
+            ))
+        return "\n\n".join(parts)
+
+    def _query_tokens(self, query: str) -> list[str]:
+        cleaned = "".join(ch if ("\u4e00" <= ch <= "\u9fff" or ch.isalnum()) else " " for ch in query)
+        words = [w.strip() for w in cleaned.split() if w.strip()]
+        tokens = set(words)
+        compact = "".join(words)
+        for i in range(max(0, len(compact) - 1)):
+            tokens.add(compact[i:i + 2])
+        for i in range(max(0, len(compact) - 2)):
+            tokens.add(compact[i:i + 3])
+        return sorted(tokens, key=len, reverse=True)[:80]
 
     def get_plot_points_text(self, volume_name: str, chapter_name: str) -> str:
         row = self.conn.execute(
